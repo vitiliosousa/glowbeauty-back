@@ -57,6 +57,25 @@ type ExpenseCategory =
 
 const toNum = (v: Prisma.Decimal | number) => Number(v);
 
+type Tx = Prisma.TransactionClient;
+
+const PAYMENT_LABELS: Record<PaymentMethod, string> = {
+  dinheiro: "Dinheiro",
+  emola: "e-Mola",
+  mpesa: "M-Pesa",
+  transferencia: "Transferência",
+};
+
+class InsufficientCashError extends Error {
+  available: number;
+  constructor(available: number) {
+    super(
+      `Saldo insuficiente no caixa. Disponível: ${available.toFixed(2)} MT.`
+    );
+    this.available = available;
+  }
+}
+
 function mapCategoryToDb(c: ExpenseCategory) {
   return c === "materia-prima" ? "materia_prima" : c;
 }
@@ -71,6 +90,84 @@ async function getMeta() {
     create: { id: 1 },
     update: {},
   });
+}
+
+/** Dinheiro que entra no caixa (vendas, entradas manuais, estornos). */
+async function cashIn(
+  tx: Tx,
+  opts: {
+    type: "entrada" | "venda";
+    amount: number;
+    note?: string | null;
+    saleId?: string;
+    expenseId?: string;
+  }
+) {
+  const meta = await tx.appMeta.upsert({
+    where: { id: 1 },
+    create: { id: 1, cashBalance: opts.amount },
+    update: { cashBalance: { increment: opts.amount } },
+  });
+  await tx.cashMovement.create({
+    data: {
+      type: opts.type,
+      amount: opts.amount,
+      balanceAfter: meta.cashBalance,
+      note: opts.note ?? null,
+      saleId: opts.saleId,
+      expenseId: opts.expenseId,
+    },
+  });
+  return toNum(meta.cashBalance);
+}
+
+/** Dinheiro que sai do caixa (despesas, saídas manuais). */
+async function cashOut(
+  tx: Tx,
+  opts: {
+    type: "saida" | "despesa";
+    amount: number;
+    note?: string | null;
+    saleId?: string;
+    expenseId?: string;
+  }
+) {
+  const meta = await tx.appMeta.upsert({
+    where: { id: 1 },
+    create: { id: 1, cashBalance: 0 },
+    update: {},
+  });
+  const available = toNum(meta.cashBalance);
+  if (opts.amount > available + 0.001) {
+    throw new InsufficientCashError(available);
+  }
+  const updated = await tx.appMeta.update({
+    where: { id: 1 },
+    data: { cashBalance: { decrement: opts.amount } },
+  });
+  await tx.cashMovement.create({
+    data: {
+      type: opts.type,
+      amount: opts.amount,
+      balanceAfter: updated.cashBalance,
+      note: opts.note ?? null,
+      saleId: opts.saleId,
+      expenseId: opts.expenseId,
+    },
+  });
+  return toNum(updated.cashBalance);
+}
+
+/** Soma o efeito líquido de movimentos ligados a uma despesa (saídas − entradas). */
+function netCashOutFromMovements(
+  movements: { type: string; amount: Prisma.Decimal | number }[]
+) {
+  return movements.reduce((sum, m) => {
+    const amount = toNum(m.amount);
+    if (m.type === "despesa" || m.type === "saida") return sum + amount;
+    if (m.type === "entrada") return sum - amount;
+    return sum;
+  }, 0);
 }
 
 async function currentProfile() {
@@ -158,6 +255,7 @@ async function loadData() {
       balanceAfter: toNum(m.balanceAfter),
       note: m.note ?? undefined,
       saleId: m.saleId ?? undefined,
+      expenseId: m.expenseId ?? undefined,
       createdAt: m.createdAt.toISOString(),
     })),
     productCounter: meta.productCounter,
@@ -317,36 +415,50 @@ app.post<{
       ? req.body.expenseAmount
       : undefined;
 
-  await prisma.$transaction(async (tx) => {
-    for (const item of validItems) {
-      await tx.stockEntry.create({
-        data: {
-          batchId,
-          productId: item.productId,
-          quantity: item.quantity,
-          expenseAmount: expenseAmount ?? null,
-        },
-      });
-      await tx.product.update({
-        where: { id: item.productId },
-        data: { stock: { increment: item.quantity } },
-      });
-    }
+  try {
+    await prisma.$transaction(async (tx) => {
+      for (const item of validItems) {
+        await tx.stockEntry.create({
+          data: {
+            batchId,
+            productId: item.productId,
+            quantity: item.quantity,
+            expenseAmount: expenseAmount ?? null,
+          },
+        });
+        await tx.product.update({
+          where: { id: item.productId },
+          data: { stock: { increment: item.quantity } },
+        });
+      }
 
-    if (expenseAmount) {
-      await tx.expense.create({
-        data: {
-          description:
-            req.body.expenseDescription?.trim() ||
-            `Compra de estoque (${validItems.length} produto${validItems.length > 1 ? "s" : ""})`,
+      if (expenseAmount) {
+        const description =
+          req.body.expenseDescription?.trim() ||
+          `Compra de estoque (${validItems.length} produto${validItems.length > 1 ? "s" : ""})`;
+        const expense = await tx.expense.create({
+          data: {
+            description,
+            amount: expenseAmount,
+            category: "estoque",
+            date: new Date(),
+            stockBatchId: batchId,
+          },
+        });
+        await cashOut(tx, {
+          type: "despesa",
           amount: expenseAmount,
-          category: "estoque",
-          date: new Date(),
-          stockBatchId: batchId,
-        },
-      });
+          note: description,
+          expenseId: expense.id,
+        });
+      }
+    });
+  } catch (err) {
+    if (err instanceof InsufficientCashError) {
+      return reply.status(400).send({ error: err.message });
     }
-  });
+    throw err;
+  }
 
   return loadData();
 });
@@ -448,20 +560,12 @@ app.post<{
       });
     }
 
-    if (pay && pay.amount > 0 && pay.method === "dinheiro") {
-      const meta = await tx.appMeta.upsert({
-        where: { id: 1 },
-        create: { id: 1, cashBalance: pay.amount },
-        update: { cashBalance: { increment: pay.amount } },
-      });
-      await tx.cashMovement.create({
-        data: {
-          type: "venda",
-          amount: pay.amount,
-          balanceAfter: meta.cashBalance,
-          note: `Venda — ${customerName}`,
-          saleId: sale.id,
-        },
+    if (pay && pay.amount > 0) {
+      await cashIn(tx, {
+        type: "venda",
+        amount: pay.amount,
+        note: `Venda (${PAYMENT_LABELS[pay.method]}) — ${customerName}`,
+        saleId: sale.id,
       });
     }
   });
@@ -504,22 +608,12 @@ app.post<{
       },
     });
 
-    if (method === "dinheiro") {
-      const meta = await tx.appMeta.upsert({
-        where: { id: 1 },
-        create: { id: 1, cashBalance: amount },
-        update: { cashBalance: { increment: amount } },
-      });
-      await tx.cashMovement.create({
-        data: {
-          type: "venda",
-          amount,
-          balanceAfter: meta.cashBalance,
-          note: `Pagamento — ${sale.customerName}`,
-          saleId: sale.id,
-        },
-      });
-    }
+    await cashIn(tx, {
+      type: "venda",
+      amount,
+      note: `Pagamento (${PAYMENT_LABELS[method]}) — ${sale.customerName}`,
+      saleId: sale.id,
+    });
   });
 
   return loadData();
@@ -532,25 +626,131 @@ app.post<{
     category: ExpenseCategory;
     date: string;
   };
-}>("/expenses", async (req) => {
+}>("/expenses", async (req, reply) => {
   const { description, amount, category, date } = req.body;
-  await prisma.expense.create({
-    data: {
-      description: description.trim(),
-      amount,
-      category: mapCategoryToDb(category),
-      date: new Date(date),
-    },
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return reply.status(400).send({ error: "Informe um valor válido." });
+  }
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.create({
+        data: {
+          description: description.trim(),
+          amount,
+          category: mapCategoryToDb(category),
+          date: new Date(date),
+        },
+      });
+      await cashOut(tx, {
+        type: "despesa",
+        amount,
+        note: description.trim(),
+        expenseId: expense.id,
+      });
+    });
+  } catch (err) {
+    if (err instanceof InsufficientCashError) {
+      return reply.status(400).send({ error: err.message });
+    }
+    throw err;
+  }
+
+  return loadData();
+});
+
+app.patch<{
+  Params: { id: string };
+  Body: {
+    description: string;
+    amount: number;
+    category: ExpenseCategory;
+    date: string;
+  };
+}>("/expenses/:id", async (req, reply) => {
+  const { description, amount, category, date } = req.body;
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return reply.status(400).send({ error: "Informe um valor válido." });
+  }
+
+  const existing = await prisma.expense.findUnique({
+    where: { id: req.params.id },
+    include: { movements: true },
   });
+  if (!existing) {
+    return reply.status(404).send({ error: "Despesa não encontrada." });
+  }
+
+  const oldAmount = toNum(existing.amount);
+  const delta = amount - oldAmount;
+  const linkedOut = netCashOutFromMovements(existing.movements);
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.expense.update({
+        where: { id: req.params.id },
+        data: {
+          description: description.trim(),
+          amount,
+          category: mapCategoryToDb(category),
+          date: new Date(date),
+        },
+      });
+
+      // Despesas antigas (sem movimento de caixa): só actualiza dados, sem debitar
+      if (linkedOut < 0.001) return;
+
+      if (Math.abs(delta) < 0.001) return;
+
+      if (delta > 0) {
+        await cashOut(tx, {
+          type: "despesa",
+          amount: delta,
+          note: `Ajuste despesa — ${description.trim()}`,
+          expenseId: existing.id,
+        });
+      } else {
+        await cashIn(tx, {
+          type: "entrada",
+          amount: -delta,
+          note: `Estorno parcial — ${description.trim()}`,
+          expenseId: existing.id,
+        });
+      }
+    });
+  } catch (err) {
+    if (err instanceof InsufficientCashError) {
+      return reply.status(400).send({ error: err.message });
+    }
+    throw err;
+  }
+
   return loadData();
 });
 
 app.delete<{ Params: { id: string } }>("/expenses/:id", async (req, reply) => {
-  try {
-    await prisma.expense.delete({ where: { id: req.params.id } });
-  } catch {
+  const existing = await prisma.expense.findUnique({
+    where: { id: req.params.id },
+    include: { movements: true },
+  });
+  if (!existing) {
     return reply.status(404).send({ error: "Despesa não encontrada." });
   }
+
+  const refund = netCashOutFromMovements(existing.movements);
+
+  await prisma.$transaction(async (tx) => {
+    if (refund > 0.001) {
+      await cashIn(tx, {
+        type: "entrada",
+        amount: refund,
+        note: `Estorno despesa — ${existing.description}`,
+        expenseId: existing.id,
+      });
+    }
+    await tx.expense.delete({ where: { id: req.params.id } });
+  });
+
   return loadData();
 });
 
@@ -562,18 +762,10 @@ app.post<{ Body: { amount: number; note?: string } }>(
       return reply.status(400).send({ error: "Informe um valor válido." });
     }
     await prisma.$transaction(async (tx) => {
-      const meta = await tx.appMeta.upsert({
-        where: { id: 1 },
-        create: { id: 1, cashBalance: amount },
-        update: { cashBalance: { increment: amount } },
-      });
-      await tx.cashMovement.create({
-        data: {
-          type: "entrada",
-          amount,
-          balanceAfter: meta.cashBalance,
-          note: note?.trim() || null,
-        },
+      await cashIn(tx, {
+        type: "entrada",
+        amount,
+        note: note?.trim() || null,
       });
     });
     return loadData();
@@ -587,26 +779,20 @@ app.post<{ Body: { amount: number; note?: string } }>(
     if (!Number.isFinite(amount) || amount <= 0) {
       return reply.status(400).send({ error: "Informe um valor válido." });
     }
-    const meta = await getMeta();
-    if (amount > toNum(meta.cashBalance) + 0.001) {
-      return reply.status(400).send({
-        error: `Saldo insuficiente. Disponível: ${toNum(meta.cashBalance).toFixed(2)} MT.`,
-      });
-    }
-    await prisma.$transaction(async (tx) => {
-      const updated = await tx.appMeta.update({
-        where: { id: 1 },
-        data: { cashBalance: { decrement: amount } },
-      });
-      await tx.cashMovement.create({
-        data: {
+    try {
+      await prisma.$transaction(async (tx) => {
+        await cashOut(tx, {
           type: "saida",
           amount,
-          balanceAfter: updated.cashBalance,
           note: note?.trim() || null,
-        },
+        });
       });
-    });
+    } catch (err) {
+      if (err instanceof InsufficientCashError) {
+        return reply.status(400).send({ error: err.message });
+      }
+      throw err;
+    }
     return loadData();
   }
 );

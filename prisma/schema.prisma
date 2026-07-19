@@ -27,6 +27,7 @@ enum CashMovementType {
   saida
   ajuste
   venda
+  despesa
 }
 
 model Product {
@@ -99,6 +100,8 @@ model Expense {
   date         DateTime
   stockBatchId String?
   createdAt    DateTime        @default(now())
+
+  movements CashMovement[]
 }
 
 model CashMovement {
@@ -108,9 +111,11 @@ model CashMovement {
   balanceAfter Decimal          @db.Decimal(12, 2)
   note         String?
   saleId       String?
+  expenseId    String?
   createdAt    DateTime         @default(now())
 
-  sale Sale? @relation(fields: [saleId], references: [id])
+  sale    Sale?    @relation(fields: [saleId], references: [id])
+  expense Expense? @relation(fields: [expenseId], references: [id], onDelete: SetNull)
 }
 
 // ponytail: single-row counter until multi-tenant matters
