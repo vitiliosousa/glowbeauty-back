@@ -13,8 +13,30 @@ const prisma = new PrismaClient();
 const app = Fastify({ logger: true });
 
 const PUBLIC = new Set(["/health", "/auth/login"]);
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || "http://localhost:3000")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 app.addHook("onRequest", async (req, reply) => {
+  const origin = req.headers.origin;
+  if (origin && CORS_ORIGINS.includes(origin)) {
+    reply.header("Access-Control-Allow-Origin", origin);
+    reply.header("Vary", "Origin");
+    reply.header(
+      "Access-Control-Allow-Headers",
+      "Authorization, Content-Type"
+    );
+    reply.header(
+      "Access-Control-Allow-Methods",
+      "GET,POST,PATCH,DELETE,OPTIONS"
+    );
+  }
+
+  if (req.method === "OPTIONS") {
+    return reply.status(204).send();
+  }
+
   const path = req.url.split("?")[0];
   if (PUBLIC.has(path)) return;
 
